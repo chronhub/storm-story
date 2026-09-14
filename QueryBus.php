@@ -82,7 +82,7 @@ final class QueryBus
                 // synchronously nests a second wrapper, and the captured error must be the type a
                 // consumer branches on, not an envelope of envelopes
                 $leaves = $e->getWrappedExceptions(recursive: true);
-                $settled[$key] = Settled::err($leaves === [] ? $e : $leaves[array_key_first($leaves)]);
+                $settled[$key] = Settled::err($leaves === [] ? $e : array_first($leaves));
             } catch (Throwable $e) {
                 $settled[$key] = Settled::err($e);
             }

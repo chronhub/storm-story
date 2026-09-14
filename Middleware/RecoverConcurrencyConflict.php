@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Storm\Story\Middleware;
 
 use Override;
-use Storm\Chronicler\Exception\DuplicateVersion;
 use Storm\Chronicler\Exception\StaleVersion;
+use Storm\Contracts\Chronicler\ConcurrencyException;
 use Storm\Contracts\Chronicler\RetryableConcurrencyConflict;
 use Storm\Contracts\Serializer\SubjectForgotten;
 use Storm\Story\Stamp\BatchModeStamp;
@@ -27,11 +27,11 @@ use Throwable;
  *
  * The event store guards append with a stream-head CAS. Under contention two consumers load the
  * same version and one loses the race, surfacing as `StaleVersion`, where the lost writer is merely
- * behind, or, past the pre-check, `DuplicateVersion`, where the `(stream, version)` unique rejected a
- * redelivery or a genuine clash. Neither carries a Messenger marker, so by default both inherit the
- * transport's `max_retries`, tuned for infra blips such as a broker or network outage, and a busy
- * aggregate's loser dead-letters after a handful of tries even though it would have won on the next
- * reload. This middleware translates the split:
+ * behind, or, past the pre-check, `\Storm\Chronicler\Exception\DuplicateVersion`, where the
+ * `(stream, version)` unique rejected a redelivery or a genuine clash. Neither carries a Messenger
+ * marker, so by default both inherit the transport's `max_retries`, tuned for infra blips such as a
+ * broker or network outage, and a busy aggregate's loser dead-letters after a handful of tries even
+ * though it would have won on the next reload. This middleware translates the split:
  *
  *  - `StaleVersion`, matched via its contracted `RetryableConcurrencyConflict` marker so any retryable
  *    conflict a store surfaces rides the same lane, becomes `RecoverableMessageHandlingException`:
@@ -45,14 +45,16 @@ use Throwable;
  *    spread out instead of re-colliding on the same tick, the thundering-herd shape; at zero the delay
  *    stays the fixed base, the pre-jitter behavior.
  *
- *  - `DuplicateVersion` becomes `UnrecoverableMessageHandlingException`: already applied, or a true
- *    clash a reload cannot fix, so it dead-letters at once rather than burn the retry budget.
+ *  - `ConcurrencyException` without the retryable marker becomes `UnrecoverableMessageHandlingException`:
+ *    the conflict is terminal, including `\Storm\Chronicler\Exception\DuplicateVersion`, so it
+ *    dead-letters at once rather than burn the retry budget.
  *
  *  - `SubjectForgotten` rides the same terminal lane: a command writing personal data about a
  *    tombstoned subject cannot succeed on ANY retry, since the tombstone is durable by design, so
  *    retrying it only delays the dead-letter an operator must see.
  *
- * The poison backstop is therefore the split itself, since a duplicate is terminal, not a retry count.
+ * The poison backstop is the split itself, since an unmarked conflict is terminal regardless of
+ * the retry count.
  * The handler raises the conflict, so it arrives wrapped in `HandlerFailedException`; the wrapped
  * exceptions are scanned, a recoverable one winning over an unrecoverable, mirroring Messenger's own
  * nested-exception rule. Anything else propagates untouched.
@@ -87,7 +89,7 @@ final readonly class RecoverConcurrencyConflict implements MiddlewareInterface
      * {@inheritDoc}
      *
      * @throws RecoverableMessageHandlingException a handler lost a version race via `StaleVersion`; retry-forward
-     * @throws UnrecoverableMessageHandlingException a handler hit a duplicate version; dead-letter at once
+     * @throws UnrecoverableMessageHandlingException a handler raised a terminal conflict or `SubjectForgotten`
      * @throws Throwable any other failure from the rest of the stack, propagated untouched
      */
     #[Override]
@@ -104,7 +106,7 @@ final readonly class RecoverConcurrencyConflict implements MiddlewareInterface
             return $stack->next()->handle($envelope, $stack);
         } catch (HandlerFailedException $e) {
             $stale = null;
-            $duplicate = null;
+            $terminal = null;
 
             // recursive: a handler dispatching SYNCHRONOUSLY wraps the inner failure in a second
             // HandlerFailedException, and a one-level read would miss the leaf, dead-lettering a
@@ -114,10 +116,9 @@ final readonly class RecoverConcurrencyConflict implements MiddlewareInterface
                 // store surfaces rides the same retry-forward lane as StaleVersion
                 if ($wrapped instanceof RetryableConcurrencyConflict) {
                     $stale = $wrapped;
-                } elseif ($wrapped instanceof DuplicateVersion || $wrapped instanceof SubjectForgotten) {
-                    // both terminal: no retry can un-append a duplicate, and no retry can un-forget
-                    // a tombstoned subject
-                    $duplicate = $wrapped;
+                } elseif ($wrapped instanceof ConcurrencyException || $wrapped instanceof SubjectForgotten) {
+                    // neither a terminal conflict nor a forgotten subject can succeed on retry
+                    $terminal = $wrapped;
                 }
             }
 
@@ -125,8 +126,8 @@ final readonly class RecoverConcurrencyConflict implements MiddlewareInterface
                 throw new RecoverableMessageHandlingException($stale->getMessage(), previous: $e, retryDelay: $this->retryDelay($envelope));
             }
 
-            if ($duplicate !== null) {
-                throw new UnrecoverableMessageHandlingException($duplicate->getMessage(), previous: $e);
+            if ($terminal !== null) {
+                throw new UnrecoverableMessageHandlingException($terminal->getMessage(), previous: $e);
             }
 
             throw $e;

@@ -11,8 +11,10 @@ use Storm\Story\Consume\InboxTransactionContext;
 use Storm\Story\Stamp\BatchModeStamp;
 use Storm\Story\Stamp\MessageIdStamp;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Throwable;
 
@@ -89,6 +91,11 @@ final readonly class DeduplicateConsumer implements MiddlewareInterface
 
                 try {
                     $handled = $stack->next()->handle($envelope, $stack);
+                } catch (HandlerFailedException $failure) {
+                    throw new HandlerFailedException(
+                        $failure->getEnvelope()->withoutAll(HandledStamp::class),
+                        $failure->getWrappedExceptions(),
+                    );
                 } finally {
                     $this->context?->leave();
                 }

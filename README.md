@@ -15,6 +15,10 @@ batched consume, an outbox publisher seam and a neutral wire serializer.
   not do for you: declare `allowed_types` (the same-trust default accepts every resolvable type) and
   validate the payload CONTENT at your reception — the serializer validates the wire form, never
   what a foreign producer put inside it;
+- **keeping a saga routable across a broker**: an INTERNAL transport whose only producer is your own
+  outbox relay declares `trusted_identity: true`, so the correlation the saga issued survives the
+  wire and its awaited event still reaches it. Left at the default, the correlation is dropped and
+  the saga waits forever on an event that arrived;
 - **sending inside an inbox transaction**: a handler that owns the at-least-once consequence signs
   with `#[DispatchesUnderInboxTransaction]` — undeclared dual-writes are refused.
 
@@ -84,6 +88,13 @@ serialization, so any runtime can produce or consume the channel. Declared per t
 - **Trust is declared per channel**: a transport fed by a foreign producer must list
   `allowed_types` — decode rejects anything else before resolving a class or touching
   `fromPayload()`. Empty trusts every resolvable type: in-process / same-trust transports only.
+- **Identity is a second, independent posture**: `trusted_identity` says whether the wire's
+  `__correlation_id`, `__actor_id`/`__actor_type` and `__tenant_id` are this deployment's own. False,
+  the default, reads them from nothing, so a foreign producer can neither steer a live saga by
+  fixing its correlation nor claim an actor it never authenticated as, and the bus mints a fresh
+  correlation per delivery. True belongs to an internal firehose whose writer is your outbox relay:
+  the identity travels intact, which is what lets an awaited event reach its saga after a broker hop.
+  A transport any producer you do not run can write to keeps the default.
 - **`version` is required at decode** and the `UpcasterChain` migrates the payload right there,
   with the same fail-fast as the store — an absent version would be "presumed current", the silent
   lie the moment a schema moves, so it is refused instead.

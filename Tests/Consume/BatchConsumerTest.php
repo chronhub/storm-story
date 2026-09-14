@@ -9,6 +9,7 @@ use LogicException;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
 use RuntimeException;
 use stdClass;
 use Storm\Chronicler\Inbox\BatchInboxStore;
@@ -18,6 +19,7 @@ use Storm\Story\Consume\BatchDecision;
 use Storm\Story\Consume\InboxTransactionContext;
 use Storm\Story\Stamp\BatchModeStamp;
 use Storm\Story\Stamp\MessageIdStamp;
+use Stringable;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\Exception\RecoverableMessageHandlingException;
@@ -81,6 +83,62 @@ final class BatchConsumerTest extends TestCase
         // batch attempt with a then b poisoning, then the replays; every dispatch STAYS batch-stamped: once() owns
         // the transaction, dedup must not nest another
         $this->assertSame([['a', true], ['b', true], ['a', true], ['b', true], ['b', true], ['c', true]], $bus->dispatched);
+    }
+
+    #[Test]
+    public function an_isolated_batch_is_logged_with_what_it_condemned(): void
+    {
+        // the one trace the poison isolation leaves: a batch that rolled back and was replayed per
+        // message is invisible from outside otherwise, its end state being the same as a batch of one
+        $logger = new IsolationLogRecorder;
+        $consumer = new BatchConsumer($this->batchInbox(), $this->bus(throwFor: 'b'), $this->perMessageInbox(), replayRetryDelayMs: 0, logger: $logger);
+
+        $consumer->process('events', [$this->envelope('a'), $this->envelope('b'), $this->envelope('c')]);
+
+        $this->assertCount(1, $logger->records);
+        $this->assertSame('warning', $logger->records[0]['level']);
+        $this->assertSame('storm.story.batch_isolated', $logger->records[0]['message']);
+        $this->assertSame(['consumer' => 'events', 'batch' => 3, 'condemned' => 1, 'redelivered' => 0, 'acked' => 2], $logger->records[0]['context']);
+    }
+
+    #[Test]
+    public function a_logger_that_throws_costs_the_batch_nothing(): void
+    {
+        // fail-open, as every observation around a commit: the replay's decisions stand
+        $logger = new class() extends AbstractLogger
+        {
+            public function log($level, string|Stringable $message, array $context = []): void
+            {
+                throw new RuntimeException('log sink down');
+            }
+        };
+        $consumer = new BatchConsumer($this->batchInbox(), $this->bus(throwFor: 'b'), $this->perMessageInbox(), replayRetryDelayMs: 0, logger: $logger);
+
+        $decisions = $consumer->process('events', [$this->envelope('a'), $this->envelope('b'), $this->envelope('c')]);
+
+        $this->assertSame([true, false, true], array_map(static fn (BatchDecision $d): bool => $d->ack, $decisions));
+    }
+
+    #[Test]
+    public function an_isolated_batch_counts_its_redelivered_apart_from_its_condemned(): void
+    {
+        $logger = new IsolationLogRecorder;
+        $busy = new RecoverableMessageHandlingException('not yet', retryDelay: 250);
+        $consumer = new BatchConsumer($this->batchInbox(), $this->busThrowing('b', static fn (): Throwable => $busy), $this->perMessageInbox(), replayRetryDelayMs: 0, logger: $logger);
+
+        $consumer->process('events', [$this->envelope('a'), $this->envelope('b')]);
+
+        $this->assertSame(['consumer' => 'events', 'batch' => 2, 'condemned' => 0, 'redelivered' => 1, 'acked' => 1], $logger->records[0]['context']);
+    }
+
+    #[Test]
+    public function a_clean_batch_logs_nothing(): void
+    {
+        $logger = new IsolationLogRecorder;
+        new BatchConsumer($this->batchInbox(), $this->bus(), $this->perMessageInbox(), replayRetryDelayMs: 0, logger: $logger)
+            ->process('events', [$this->envelope('a'), $this->envelope('b')]);
+
+        $this->assertSame([], $logger->records);
     }
 
     #[Test]
@@ -658,5 +716,19 @@ final class BatchConsumerTest extends TestCase
                 return $envelope;
             }
         };
+    }
+}
+
+/**
+ * The PSR logger as a recorder, level, message and context kept as given.
+ */
+final class IsolationLogRecorder extends AbstractLogger
+{
+    /** @var list<array{level: string, message: string, context: array<string, mixed>}> */
+    public array $records = [];
+
+    public function log($level, string|Stringable $message, array $context = []): void
+    {
+        $this->records[] = ['level' => (string) $level, 'message' => (string) $message, 'context' => $context];
     }
 }

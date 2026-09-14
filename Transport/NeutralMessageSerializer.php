@@ -21,6 +21,7 @@ use Storm\Serializer\MessageSerializer;
 use Storm\Serializer\SerializedMessage;
 use Storm\Story\Stamp\ContextStamps;
 use Storm\Story\Stamp\StoredHeaderStamp;
+use Storm\Story\Stamp\UntrustedMessageIdStamp;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 use Symfony\Component\Messenger\RoutableMessageBus;
@@ -83,13 +84,18 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
  *   either, a deliberate non-goal: they are rich, PHP-specific objects serving the `messenger:failed:*`
  *   ops tooling of an INTERNAL store, with no cross-runtime value. A deployment rule follows, and it is
  *   the one to remember here: never bind this serializer on a failure transport, or that tooling goes
- *   blind; a failure transport stays on the default `PhpSerializer`, which keeps every stamp.
+ *   blind; a failure transport stays on the default `PhpSerializer`, which preserves sendable stamps
+ *   including `UntrustedMessageIdStamp` when capture precedes bus enrichment.
  *
- * - `__correlation_id`, `__actor_id`/`__actor_type` and `__tenant_id` cross the wire in the body but
- *   become nothing: `decode()` reads them through `ContextStamps::fromMessage` with ambient identity
- *   untrusted, so none becomes a stamp. A foreign producer fixing the correlation that routes a live
- *   saga, or claiming an actor or tenant it never authenticated as, is a capability this edge must not
- *   grant. The declared bag, `storm.context.propagated_keys`, is the legitimate channel and is unaffected.
+ * - `__correlation_id`, `__actor_id`/`__actor_type` and `__tenant_id` cross the wire in the body and
+ *   become what the channel's declared posture allows. Untrusted, the default, they become nothing:
+ *   `decode()` reads them through `ContextStamps::fromMessage` with ambient identity untrusted, so none
+ *   becomes a stamp. A foreign producer fixing the correlation that routes a live saga, or claiming an
+ *   actor or tenant it never authenticated as, is a capability that edge must not grant.
+ *   `UntrustedMessageIdStamp` also prevents the producer message id from seeding correlation. The bus
+ *   assigns a fresh local correlation per neutral delivery; the stable message id still supplies
+ *   deduplication and causation. Internal failure serialization preserves this provenance for replay.
+ *   The declared bag, `storm.context.propagated_keys`, is the legitimate channel and is unaffected.
  *
  * The bus a decoded message routes to is transport configuration, never producer input. Without a bus
  * name the worker's `RoutableMessageBus` falls back to the default bus and an event handler bound to the
@@ -98,12 +104,21 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
  * emitted on `encode()` as advisory routing metadata for a foreign consumer, but this decoder never trusts
  * it: letting the producer pick the internal bus is a capability it must not have.
  *
- * Trust model at the untrusted edge. A transport fed by a foreign producer must be given `$allowedTypes`,
- * the wire `type` aliases this channel accepts; `decode()` rejects anything else BEFORE resolving the class
- * or calling `fromPayload()`, so a loadable-but-unregistered FQCN can neither be instantiated nor dispatched.
- * Left null, the channel trusts every resolvable type, correct only for an in-process or same-trust-domain
- * transport, never for an integration edge. Pair `$allowedTypes` with a strict `EventTypeMapper`, one whose
- * `toClass` has no FQCN fallback, for defense in depth; the allowlist alone already gates instantiation.
+ * Trust model, declared per channel and in two independent halves. `$allowedTypes` is WHAT may arrive: a
+ * transport fed by a foreign producer must be given the wire `type` aliases this channel accepts, and
+ * `decode()` rejects anything else BEFORE resolving the class or calling `fromPayload()`, so a
+ * loadable-but-unregistered FQCN can neither be instantiated nor dispatched. Left null, the channel trusts
+ * every resolvable type, correct only for an in-process or same-trust-domain transport, never for an
+ * integration edge. Pair `$allowedTypes` with a strict `EventTypeMapper`, one whose `toClass` has no FQCN
+ * fallback, for defense in depth; the allowlist alone already gates instantiation.
+ *
+ * `$trustedIdentity` is WHOSE identity the message carries, and it defaults to false, the integration-edge
+ * posture. Set it only on a channel whose producers are the deployment's own, an internal firehose whose
+ * writer is its outbox relay: the ambient identity then travels intact, correlation included, and the
+ * producer message id seeds a missing correlation the way an in-process dispatch does. That is what keeps
+ * a saga routable across a broker hop, since the awaited event reaches the outcome router under the very
+ * correlation its saga issued. A channel reachable by any producer the deployment does not run keeps the
+ * default: correlation is a saga's steering wheel, and handing it to a stranger is handing over the saga.
  *
  * @see \Storm\Message\Header::MessageType
  * @see \Symfony\Component\Messenger\RoutableMessageBus
@@ -123,6 +138,10 @@ final readonly class NeutralMessageSerializer implements SerializerInterface
      *                            read from the wire; null attaches no bus stamp, Messenger's default bus
      * @param  list<string>|null  $allowedTypes  the wire `type` aliases this channel accepts; null trusts
      *                                           every resolvable type, for in-process or same-trust transports only
+     * @param  bool  $trustedIdentity  true only for a channel whose producers are the deployment's own: the
+     *                                 wire's correlation, actor and tenant then become ambient identity and
+     *                                 the producer message id may seed a missing correlation. False, the
+     *                                 default, is the integration-edge posture
      */
     public function __construct(
         private MessageSerializer $serializer,
@@ -136,6 +155,7 @@ final readonly class NeutralMessageSerializer implements SerializerInterface
          * @var list<string>
          */
         private array $propagatedKeys = [],
+        private bool $trustedIdentity = false,
     ) {}
 
     /**
@@ -257,23 +277,30 @@ final readonly class NeutralMessageSerializer implements SerializerInterface
         }
 
         try {
-            // untrusted producer, so ambient identity is not: __correlation_id, __actor_id/__actor_type
-            // and __tenant_id read from nothing here, since honoring them would let a foreign producer
-            // fix the correlation that steers a live saga, or claim an actor or tenant it never
-            // authenticated as. The declared bag is unaffected, an app-level opt-in with no such claim.
-            //
-            // Deferred, not built: a trusted-producer allowlist that would honor these identifiers for a
-            // declared, verified internal service sharing this bus. Revisit only if one appears; nothing
-            // today needs it, and a speculative seam here would be unexercised surface.
+            // the channel's declared posture decides what the wire's ambient identity becomes. Untrusted,
+            // the default: __correlation_id, __actor_id/__actor_type and __tenant_id read from nothing
+            // here, since honoring them would let a foreign producer fix the correlation that steers a
+            // live saga, or claim an actor or tenant it never authenticated as. Trusted: the channel's
+            // producers are the deployment's own, so the identity they stamped travels intact and the
+            // saga awaiting the event is still reachable on the other side of the broker. The declared
+            // bag is unaffected either way, an app-level opt-in with no such claim.
             $stamps = [
-                ...ContextStamps::fromMessage($message, $this->propagatedKeys, trustAmbientIdentity: false),
+                ...ContextStamps::fromMessage($message, $this->propagatedKeys, trustAmbientIdentity: $this->trustedIdentity),
                 new StoredHeaderStamp($message->headers()),
             ];
+
+            if (! $this->trustedIdentity) {
+                // the marker travels with the untrusted posture alone: it is what stops the producer id
+                // from seeding correlation, and on a trusted channel that id IS the deployment's own,
+                // the very seed an in-process dispatch uses, stable across every redelivery
+                $stamps[] = new UntrustedMessageIdStamp;
+            }
         } catch (InvalidArgumentException|InvalidActor $e) {
-            // with ambient identity untrusted, the only reachable throw here is the declared bag's own
-            // validation, a blank, padded or reserved-prefixed key; still the untrusted edge, so it must
-            // reject-to-failure-transport, not crash the worker with a type Messenger's receivers don't
-            // recognize.
+            // the only reachable throw here is the declared bag's own validation, a blank, padded or
+            // reserved-prefixed key: whatever the posture, the half-actor pair is refused a few lines up
+            // and the header vocabulary already rejected a blank actor id or type inside deserialize. It
+            // is still the untrusted edge, so it must reject-to-failure-transport, not crash the worker
+            // with a type Messenger's receivers don't recognize.
             //
             // `InvalidActor` stays in the union for the contract `fromMessage` still declares; dropping
             // it is an EQUIVALENT mutant regardless, by the type hierarchy: it extends

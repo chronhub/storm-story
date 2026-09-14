@@ -42,6 +42,20 @@ use Symfony\Component\Messenger\Transport\Sender\SenderInterface;
 final class ConsumeBatchedCommandTest extends TestCase
 {
     #[Test]
+    public function time_limit_stops_an_idle_consumer_after_acking_its_batch(): void
+    {
+        $envelope = $this->envelope();
+        $receiver = $this->receiver($envelope);
+        $tester = new CommandTester($this->command($receiver, $this->processor($this->ackAll())));
+
+        $tester->execute(['transport' => 'events', '--batch-size' => '1', '--idle-ms' => '10', '--time-limit' => '1']);
+
+        $tester->assertCommandIsSuccessful();
+        self::assertSame([$envelope], $receiver->acked);
+        self::assertSame([], $receiver->rejected);
+    }
+
+    #[Test]
     public function collects_a_partial_batch_acks_it_and_reports_the_count(): void
     {
         [$e1, $e2, $e3] = [$this->envelope(), $this->envelope(), $this->envelope()];

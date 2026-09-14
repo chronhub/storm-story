@@ -15,8 +15,10 @@ use Storm\Story\Middleware\DeduplicateConsumer;
 use Storm\Story\Stamp\BatchModeStamp;
 use Storm\Story\Stamp\MessageIdStamp;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 
 final class DeduplicateConsumerTest extends TestCase
@@ -141,6 +143,35 @@ final class DeduplicateConsumerTest extends TestCase
             );
             $this->fail('expected the handler failure to propagate');
         } catch (RuntimeException) {
+        }
+
+        $this->assertFalse($context->active());
+    }
+
+    #[Test]
+    public function removes_only_handler_success_stamps_from_an_inbox_failure(): void
+    {
+        $id = new MessageIdStamp('evt-rollback');
+        $received = new ReceivedStamp('events');
+        $envelope = new Envelope(new stdClass, [$received, $id]);
+        $errors = ['second' => new RuntimeException('second failed'), 'third' => new RuntimeException('third failed')];
+        $failure = new HandlerFailedException($envelope->with(new HandledStamp('result', 'first')), $errors);
+        $context = new InboxTransactionContext;
+
+        try {
+            new DeduplicateConsumer($this->inbox(), $context)->handle(
+                $envelope,
+                $this->terminal(static function () use ($failure): void {
+                    throw $failure;
+                }),
+            );
+            $this->fail('Expected the handler failure');
+        } catch (HandlerFailedException $caught) {
+            $this->assertSame([], $caught->getEnvelope()->all(HandledStamp::class));
+            $this->assertSame($errors, $caught->getWrappedExceptions());
+            $this->assertSame($id, $caught->getEnvelope()->last(MessageIdStamp::class));
+            $this->assertSame($received, $caught->getEnvelope()->last(ReceivedStamp::class));
+            $this->assertSame($envelope->getMessage(), $caught->getEnvelope()->getMessage());
         }
 
         $this->assertFalse($context->active());

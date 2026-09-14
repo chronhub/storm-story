@@ -12,6 +12,7 @@ use Storm\Contracts\Message\MetaIdentityGenerator;
 use Storm\Story\Middleware\AssignMessageMetadata;
 use Storm\Story\Stamp\CorrelationStamp;
 use Storm\Story\Stamp\MessageIdStamp;
+use Storm\Story\Stamp\UntrustedMessageIdStamp;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
@@ -56,6 +57,20 @@ final class AssignMessageMetadataTest extends TestCase
 
         $this->assertSame('existing-id', $envelope->last(MessageIdStamp::class)?->id);
         $this->assertSame('trace-1', $envelope->last(CorrelationStamp::class)?->id);
+    }
+
+    #[Test]
+    public function a_locally_correlated_untrusted_id_is_idempotent_on_redispatch(): void
+    {
+        $middleware = new AssignMessageMetadata($this->identityReturning('local-correlation'));
+        $incoming = new Envelope(new stdClass, [new MessageIdStamp('producer-id'), new UntrustedMessageIdStamp]);
+
+        $once = $middleware->handle($incoming, $this->terminal());
+        $twice = $middleware->handle($once, $this->terminal());
+
+        $this->assertSame('producer-id', $once->last(MessageIdStamp::class)?->id);
+        $this->assertSame('local-correlation', $once->last(CorrelationStamp::class)?->id);
+        $this->assertSame($once, $twice);
     }
 
     private function identityReturning(string $id): MetaIdentityGenerator

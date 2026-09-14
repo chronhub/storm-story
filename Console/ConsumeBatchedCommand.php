@@ -389,7 +389,7 @@ final class ConsumeBatchedCommand extends Command
         $batch = [];
         $idleDeadline = null;
 
-        while (count($batch) < $size) {
+        while (! $this->stopRequested && count($batch) < $size) {
             $got = false;
 
             try {

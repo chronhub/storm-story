@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Storm\Story\Consume;
 
 use LogicException;
+use Psr\Log\LoggerInterface;
 use Storm\Chronicler\Inbox\BatchInboxStore;
 use Storm\Chronicler\Inbox\InboxItem;
 use Storm\Chronicler\Inbox\InboxStore;
@@ -103,6 +104,13 @@ final readonly class BatchConsumer implements BatchProcessor
         private int $recoverableRedeliveryCap = 300,
         /** The broker hold between redeliveries when the recoverable exception carries no retryDelay of its own. */
         private int $recoverableRedeliveryDelayMs = 1000,
+        /**
+         * Where an isolated batch leaves its one trace, `storm.story.batch_isolated` at warning: a batch
+         * that rolled back and was replayed per message ends in the same state as a batch of one, the
+         * poison captured and the innocents committed, so nothing outside says a batch was poisoned
+         * unless this line does. Null logs nothing, for standalone use.
+         */
+        private ?LoggerInterface $logger = null,
     ) {}
 
     /**
@@ -151,15 +159,48 @@ final readonly class BatchConsumer implements BatchProcessor
                 }
             } catch (BatchHandlerFailed) {
                 // a handler poisoned the batch; the transaction rolled back, isolate per message
-                foreach ($this->isolate($consumer, $identified) as $i => $decision) {
+                $isolated = $this->isolate($consumer, $identified);
+                foreach ($isolated as $i => $decision) {
                     $decisions[$i] = $decision;
                 }
+                $this->logIsolation($consumer, $isolated);
             }
         }
 
         ksort($decisions);
 
         return array_values($decisions);
+    }
+
+    /**
+     * The trace of an isolation, once per poisoned batch: how many it held, how many the replay
+     * condemned to the failure transport, redelivered, or acked. Fail-open, as every observation
+     * around a commit is: a logger that throws must not undo a replay that committed.
+     *
+     * @param  array<int, BatchDecision>  $isolated
+     */
+    private function logIsolation(string $consumer, array $isolated): void
+    {
+        if ($this->logger === null) {
+            return;
+        }
+        $condemned = 0;
+        $redelivered = 0;
+        $acked = 0;
+        foreach ($isolated as $decision) {
+            if ($decision->ack) {
+                $acked++;
+            } elseif ($decision->redeliverDelayMs !== null) {
+                $redelivered++;
+            } else {
+                $condemned++;
+            }
+        }
+        try {
+            $this->logger->warning('storm.story.batch_isolated', ['consumer' => $consumer, 'batch' => count($isolated), 'condemned' => $condemned, 'redelivered' => $redelivered, 'acked' => $acked]);
+        } catch (Throwable) {
+            // the observation may lose its line; it may never cost the batch its decisions
+        }
     }
 
     /**
